@@ -3,18 +3,30 @@
 //! It relies on the niri IPC to verify if a window is the only one of a workspace,
 //! whether it's the first one opened or the last remaining ones after all the other windows got closed,
 //! and maximize it if so.
+//!
+//! FORK NOTE: added `-C` / `--column-widths` mode, which repurposes the same
+//! per-workspace window tracking to manage column widths for an
+//! ultrawide-style layout instead of maximizing. See column_widths_mode.rs.
+//! This mode is purely positional (re-derives left/center/right from
+//! niri's own column data on every relevant event) rather than tracking
+//! "master" identity across transitions, and can be paused/resumed by
+//! sending SIGUSR1 to the process (e.g. from a niri keybind).
 
 use clap::Parser;
 use log::{debug, error, info};
-use niri_ipc::{Event, state::EventStreamState, state::EventStreamStatePart};
+use niri_ipc::socket::Socket;
+use niri_ipc::{Event, Output, state::EventStreamState, state::EventStreamStatePart};
+use signal_hook::consts::SIGUSR1;
+use signal_hook::iterator::Signals;
 use std::collections::HashMap;
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+mod column_widths_mode;
 mod help;
 mod lockfile;
 mod outputs_map; // https://github.com/Antiz96/oniri/issues/3
-mod reclaim_space;
-mod size_compare; // https://github.com/Antiz96/oniri/issues/3
 mod socket_connections;
 mod version;
 mod window;
@@ -24,29 +36,96 @@ mod windows_map;
 #[derive(Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 struct Args {
-    #[arg(short = 'F', long)]
-    first_only: bool,
-
-    #[arg(short = 'T', long)]
-    tiling_layout: bool,
-
-    #[arg(short = 'E', long)]
-    edges_maximizing: bool,
-
-    #[arg(short = 'R', long)]
-    reclaim_space: bool,
-
-    #[arg(short = 'H', long, default_value_t = 150)]
-    height_tolerance: i32,
-
-    #[arg(short = 'W', long, default_value_t = 150)]
-    width_tolerance: i32,
-
-    #[arg(short = 'h', long)]
+    /// Show this help message
+    #[arg(short = 'h', long = "help")]
     help: bool,
 
-    #[arg(short = 'V', long)]
+    #[arg(short = 'V', long = "version")]
     version: bool,
+}
+
+/// Which output a workspace currently lives on, for config scoping.
+fn workspace_output(state: &EventStreamState, ws: u64) -> Option<String> {
+    state
+        .workspaces
+        .workspaces
+        .get(&ws)
+        .and_then(|w| w.output.clone())
+}
+
+/// A window's current column index, straight from niri -- not tracked by
+/// us for this purpose (the tracking we DO keep, `last_known_columns`, is
+/// only to detect *changes*, below).
+fn window_column(state: &EventStreamState, id: u64) -> Option<usize> {
+    state
+        .windows
+        .windows
+        .get(&id)
+        .and_then(|w| w.layout.pos_in_scrolling_layout)
+        .map(|(col, _tile)| col)
+}
+
+/// Record each window's current column so the next WindowLayoutsChanged
+/// event can tell whether anything actually moved. Column index is
+/// unaffected by width changes, so it's safe to seed this right after we
+/// issue our own resize actions -- it won't go stale from that.
+fn seed_column_cache(state: &EventStreamState, windows: &[u64], cache: &mut HashMap<u64, usize>) {
+    for &id in windows {
+        if let Some(col) = window_column(state, id) {
+            cache.insert(id, col);
+        }
+    }
+}
+
+/// Re-derive and apply the column-widths rule for whatever count is
+/// currently on this workspace. Purely positional -- no history. Safe to
+/// call repeatedly; re-applying the same width is a no-op.
+fn reconcile(
+    action_socket: &mut Socket,
+    state: &EventStreamState,
+    outputs: &HashMap<String, Output>,
+    config: &column_widths_mode::ColumnWidthsConfig,
+    paused: &Arc<AtomicBool>,
+    ws: u64,
+    windows: &[u64],
+) {
+    if paused.load(Ordering::SeqCst) {
+        return;
+    }
+    if !config.applies_to(workspace_output(state, ws).as_deref(), outputs) {
+        return;
+    }
+
+    let sorted = column_widths_mode::columns_by_position(state, windows);
+    let num_windows = sorted.len();
+    log::debug!("windows: {}, sorted: {}", windows.len(), sorted.len());
+    if num_windows < 1 {
+        return;
+    }
+
+    match num_windows {
+        0 => {}
+        1 => {
+            column_widths_mode::set_sole(action_socket, sorted[0])
+                .unwrap_or_else(|error| error!("{error:?}"));
+        }
+        2 => {
+            column_widths_mode::set_duo(action_socket, sorted[0], sorted[1])
+                .unwrap_or_else(|error| error!("{error:?}"));
+        }
+        3 => {
+            column_widths_mode::set_trio(action_socket, sorted[0], sorted[1], sorted[2])
+                .unwrap_or_else(|error| error!("{error:?}"));
+        }
+        _ => {
+            column_widths_mode::set_new_window_default(
+                action_socket,
+                num_windows,
+                *sorted.last().unwrap(),
+            )
+            .unwrap_or_else(|error| error!("{error:?}"));
+        }
+    }
 }
 
 fn main() {
@@ -76,37 +155,28 @@ fn main() {
         process::exit(1);
     });
 
-    // Run in "first-only" mode if the -F / --first-only arg is passed
-    let first_only = args.first_only;
-    if first_only {
-        info!("Running in first-only mode: only acting on the first window");
-    }
+    let config = column_widths_mode::ColumnWidthsConfig::load();
+    let paused = Arc::new(AtomicBool::new(false));
 
-    // Run in "tiling-layout" mode if the -T / --tiling-layout arg is passed
-    let tiling_layout = args.tiling_layout;
-    if tiling_layout {
-        info!(
-            "Running in tiling-layout mode: Opening a second window will collapse the first window"
-        );
-    }
-
-    // Run in "edges-maximizing" mode if the -E / --edges-maximizing arg is passed
-    let edges_maximizing = args.edges_maximizing;
-    if edges_maximizing {
-        info!("Running in edges-maximizing mode: Maximize windows to edges");
-    }
-
-    // Run in "reclaim-space" mode if the -R / --reclaim-space arg is passed
-    let reclaim_space = args.reclaim_space;
-    if reclaim_space {
-        info!("Running in reclaim-space mode: Reclaim empty screen space left by closed windows");
-    }
-
-    // Set pixel tolerances for window/output size comparison
-    // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
-    let tol_h = args.height_tolerance;
-    let tol_w = args.width_tolerance;
-    info!("Using tolerances: height={tol_h}, width={tol_w}");
+    let paused_for_signal = Arc::clone(&paused);
+    std::thread::spawn(move || {
+        let mut signals = match Signals::new([SIGUSR1]) {
+            Ok(s) => s,
+            Err(error) => {
+                error!("Failed to register SIGUSR1 handler: {error:?}");
+                return;
+            }
+        };
+        for _ in signals.forever() {
+            let now_paused = !paused_for_signal.load(Ordering::SeqCst);
+            paused_for_signal.store(now_paused, Ordering::SeqCst);
+            if now_paused {
+                info!("[column-widths] paused");
+            } else {
+                info!("[column-widths] resumed");
+            }
+        }
+    });
 
     // Initialize connections to niri IPC socket, start the event stream and gather events
     let (event_socket, mut action_socket) = socket_connections::init_socket_connections()
@@ -118,10 +188,11 @@ fn main() {
     // Gather state and create an outputs map
     // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
     let mut state = EventStreamState::default();
-    let outputs = outputs_map::init_outputs_map(&mut action_socket).unwrap_or_else(|error| {
-        error!("{error:?}");
-        process::exit(3);
-    });
+    let outputs: HashMap<String, Output> =
+        outputs_map::init_outputs_map(&mut action_socket, &config).unwrap_or_else(|error| {
+            error!("{error:?}");
+            process::exit(3);
+        });
 
     // Create a workspace/window(s) map and initialize it
     let mut workspace_windows =
@@ -137,6 +208,14 @@ fn main() {
     // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
     let mut moved_windows_map = HashMap::<u64, u64>::new();
 
+    // column-widths mode only: last-seen column index per window, used to
+    // tell a genuine column move apart from a mere resize (including our
+    // own) in WindowLayoutsChanged -- see reconcile_duo_trio's call site.
+    let mut last_known_columns: HashMap<u64, usize> = HashMap::new();
+    for windows in workspace_windows.values() {
+        seed_column_cache(&state, windows, &mut last_known_columns);
+    }
+
     // Read events gathered from the IPC socket
     let mut read_event = event_socket.read_events();
 
@@ -150,7 +229,7 @@ fn main() {
         match event {
             // Window being opened
             Event::WindowOpenedOrChanged { window } => {
-                // Skip floating windows (they cannot/should not be maximized)
+                // Skip floating windows (they cannot/should not be maximized or width-managed)
                 if window.is_floating {
                     continue;
                 }
@@ -185,67 +264,51 @@ fn main() {
 
                 let windows = workspace_windows.entry(ws).or_default();
                 windows.push(id);
+                let windows_snapshot = windows.clone();
 
-                // Check if there's only one window in the current workspace & maximize it if so
-                match windows.len() {
-                    1 => {
-                        let first_window = windows[0];
-                        if !size_compare::is_maximized(&state, &outputs, first_window, tol_h, tol_w)
-                        {
-                            window::maximize_window(
-                                &mut action_socket,
-                                &state,
-                                first_window,
-                                edges_maximizing,
-                            )
-                            .unwrap_or_else(|error| {
-                                error!("{error:?}");
-                            });
-                        }
+                if windows_snapshot.len() > 4 {
+                    if config.applies_to(workspace_output(&state, ws).as_deref(), &outputs)
+                        && !paused.load(Ordering::SeqCst)
+                    {
+                        column_widths_mode::set_new_window_default(
+                            &mut action_socket,
+                            windows_snapshot.len(),
+                            id,
+                        )
+                        .unwrap_or_else(|error| error!("{error:?}"));
                     }
-
-                    // If running in tiling layout mode, un-maximize the first window when a second one is opened
-                    2 if tiling_layout => {
-                        let first_window = windows[0];
-                        if size_compare::is_maximized(&state, &outputs, first_window, tol_h, tol_w)
-                        {
-                            window::maximize_window(
-                                &mut action_socket,
-                                &state,
-                                first_window,
-                                edges_maximizing,
-                            )
-                            .unwrap_or_else(|error| {
-                                error!("{error:?}");
-                            });
-                        }
-                    }
-                    _ => {}
+                } else {
+                    reconcile(
+                        &mut action_socket,
+                        &state,
+                        &outputs,
+                        &config,
+                        &paused,
+                        ws,
+                        &windows_snapshot,
+                    );
+                    seed_column_cache(&state, &windows_snapshot, &mut last_known_columns);
                 }
 
                 // If the window that triggered the event has been moved to another workspace:
                 if let Some(old_ws) = previous_ws
                     && old_ws != ws
                 {
-                    // If there's one window left in the previous workspace, maximize it
-                    // (unless we're running in "first-only" mode).
-                    if !first_only
-                        && let Some(old_windows) = workspace_windows.get(&old_ws)
-                        && old_windows.len() == 1
-                    {
-                        let remaining = old_windows[0];
-
-                        if !size_compare::is_maximized(&state, &outputs, remaining, tol_h, tol_w) {
-                            window::maximize_window(
+                    if let Some(old_windows) = workspace_windows.get(&old_ws) {
+                        let old_windows = old_windows.clone();
+                        if old_windows.len() <= 4 {
+                            reconcile(
                                 &mut action_socket,
                                 &state,
-                                remaining,
-                                edges_maximizing,
-                            )
-                            .unwrap_or_else(|error| {
-                                error!("{error:?}");
-                            });
+                                &outputs,
+                                &config,
+                                &paused,
+                                old_ws,
+                                &old_windows,
+                            );
+                            seed_column_cache(&state, &old_windows, &mut last_known_columns);
                         }
+                        // still >4 after losing one: nothing to do, matches the "leave existing untouched" rule
                     }
 
                     // Track windows that have moved workspaces until their tile size is properly recalculated
@@ -257,57 +320,11 @@ fn main() {
                 }
             }
 
-            Event::WindowLayoutsChanged { changes } => {
-                for (id, _) in changes {
-                    if let Some(old_ws) = moved_windows_map.remove(&id) {
-                        // Retrieve updated window and workspace state
-                        let Some(window) = state.windows.windows.get(&id) else {
-                            continue;
-                        };
-
-                        let Some(ws) = window.workspace_id else {
-                            continue;
-                        };
-
-                        let Some(windows) = workspace_windows.get(&ws) else {
-                            continue;
-                        };
-
-                        // In tiling layout mode, un-maximize the current window
-                        // if it was previously the only window of its workspace but now isn't
-                        if tiling_layout
-                            && windows.len() > 1
-                            && let Some(&last_window) = windows.last()
-                            && workspace_windows
-                                .get(&old_ws)
-                                .is_none_or(|old_windows| old_windows.is_empty())
-                            && size_compare::is_maximized(
-                                &state,
-                                &outputs,
-                                last_window,
-                                tol_h,
-                                tol_w,
-                            )
-                        {
-                            window::maximize_window(
-                                &mut action_socket,
-                                &state,
-                                last_window,
-                                edges_maximizing,
-                            )
-                            .unwrap_or_else(|error| {
-                                error!("{error:?}");
-                            });
-                        }
-                    }
-                }
-            }
-
             // Window being closed
             Event::WindowClosed { id } => {
                 debug!("Trigger Event: Window Closed");
 
-                let Some((_, windows)) = workspace_windows
+                let Some((&ws, windows)) = workspace_windows
                     .iter_mut()
                     .find(|(_, windows)| windows.contains(&id))
                 else {
@@ -317,49 +334,19 @@ fn main() {
                 // Update the workspace vector
                 windows.retain(|&wid| wid != id);
 
-                // If running in "reclaim-space" mode, nudge the focus to close any empty space
-                // left by the closed windows (if needed)
-                if reclaim_space && windows.len() > 1 {
-                    // Get the ID of the newly focused window
-                    let Some(focused_id) = state
-                        .windows
-                        .windows
-                        .values()
-                        .find_map(|window| window.is_focused.then_some(window.id))
-                    // Logging this scenario in case it ever happens but, given we execute this only
-                    // if we have more than a single window, this should technically be impossible
-                    //
-                    // An `.expect()` could be safely used here technically but, in the eventuality where
-                    // the state is somehow inconsistent, this isn't worth a panic in my opinion
-                    else {
-                        error!("No focused window found after closing window");
-                        continue;
-                    };
-
-                    // If it is last in the viewport, nudge focus left / right to re-center it
-                    if reclaim_space::is_last(&state, focused_id) {
-                        reclaim_space::nudge_focus(&mut action_socket).unwrap_or_else(|error| {
-                            error!("{error:?}");
-                        });
-                    }
-                }
-
-                // Skip if running in "first only" mode
-                if first_only {
-                    continue;
-                }
-
-                // Check if there's only one window in the workspace/window(s) map & maximize it if so
-                if windows.len() != 1 {
-                    continue;
-                }
-
-                let id = windows[0];
-                if !size_compare::is_maximized(&state, &outputs, id, tol_h, tol_w) {
-                    window::maximize_window(&mut action_socket, &state, id, edges_maximizing)
-                        .unwrap_or_else(|error| {
-                            error!("{error:?}");
-                        });
+                last_known_columns.remove(&id);
+                let windows_snapshot = windows.clone();
+                if windows_snapshot.len() <= 4 {
+                    reconcile(
+                        &mut action_socket,
+                        &state,
+                        &outputs,
+                        &config,
+                        &paused,
+                        ws,
+                        &windows_snapshot,
+                    );
+                    seed_column_cache(&state, &windows_snapshot, &mut last_known_columns);
                 }
             }
             // Ignore other events

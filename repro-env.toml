@@ -1,6 +1,0 @@
-[container]
-image = "docker.io/archlinux/archlinux"
-
-[packages]
-system = "archlinux"
-dependencies = ["cargo", "musl", "rust-musl"]

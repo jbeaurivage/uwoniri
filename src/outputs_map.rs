@@ -7,7 +7,12 @@ use log::info;
 use niri_ipc::{Output, Request, Response, socket::Socket};
 use std::collections::HashMap;
 
-pub fn init_outputs_map(action_socket: &mut Socket) -> anyhow::Result<HashMap<String, Output>> {
+use crate::column_widths_mode::{self, ColumnWidthsConfig};
+
+pub fn init_outputs_map(
+    action_socket: &mut Socket,
+    config: &ColumnWidthsConfig,
+) -> anyhow::Result<HashMap<String, Output>> {
     let response = action_socket
         .send(Request::Outputs)
         .context("Failed to get outputs list")?;
@@ -19,7 +24,12 @@ pub fn init_outputs_map(action_socket: &mut Socket) -> anyhow::Result<HashMap<St
     };
 
     for name in outputs.keys() {
-        info!("Registered output: {name}");
+        let uw_applies = config.applies_to(Some(&name), &outputs);
+        if uw_applies {
+            info!("Registered output: {name}");
+        } else {
+            info!("Ignored output: {name}");
+        }
     }
 
     Ok(outputs)
