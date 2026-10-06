@@ -22,7 +22,8 @@ pub fn maximize_window(
 
         info!("Maximized window to edges {window_id}");
     } else {
-        // We need this information to restore focus state after maximizing @window_id
+        // We need this information to restore focus state after maximizing
+        // @window_id
         let Some(focused_id) = state
             .windows
             .windows

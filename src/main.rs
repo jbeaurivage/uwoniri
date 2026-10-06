@@ -1,8 +1,9 @@
-//! Oniri - A tool that automatically maximizes the only window of a niri workspace.
+//! Oniri - A tool that automatically maximizes the only window of a niri
+//! workspace.
 //!
-//! It relies on the niri IPC to verify if a window is the only one of a workspace,
-//! whether it's the first one opened or the last remaining ones after all the other windows got closed,
-//! and maximize it if so.
+//! It relies on the niri IPC to verify if a window is the only one of a
+//! workspace, whether it's the first one opened or the last remaining ones
+//! after all the other windows got closed, and maximize it if so.
 //!
 //! FORK NOTE: added `-C` / `--column-widths` mode, which repurposes the same
 //! per-workspace window tracking to manage column widths for an
@@ -15,13 +16,15 @@
 use clap::Parser;
 use log::{debug, error, info};
 use niri_ipc::socket::Socket;
-use niri_ipc::{Event, Output, state::EventStreamState, state::EventStreamStatePart};
+use niri_ipc::{Event, Output};
 use signal_hook::consts::SIGUSR1;
 use signal_hook::iterator::Signals;
 use std::collections::HashMap;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::column_widths_mode::workspace_output;
 
 mod column_widths_mode;
 mod help;
@@ -44,45 +47,8 @@ struct Args {
     version: bool,
 }
 
-/// Which output a workspace currently lives on, for config scoping.
-fn workspace_output(state: &EventStreamState, ws: u64) -> Option<String> {
-    state
-        .workspaces
-        .workspaces
-        .get(&ws)
-        .and_then(|w| w.output.clone())
-}
-
-/// A window's current column index, straight from niri -- not tracked by
-/// us for this purpose (the tracking we DO keep, `last_known_columns`, is
-/// only to detect *changes*, below).
-fn window_column(state: &EventStreamState, id: u64) -> Option<usize> {
-    state
-        .windows
-        .windows
-        .get(&id)
-        .and_then(|w| w.layout.pos_in_scrolling_layout)
-        .map(|(col, _tile)| col)
-}
-
-/// Record each window's current column so the next WindowLayoutsChanged
-/// event can tell whether anything actually moved. Column index is
-/// unaffected by width changes, so it's safe to seed this right after we
-/// issue our own resize actions -- it won't go stale from that.
-fn seed_column_cache(state: &EventStreamState, windows: &[u64], cache: &mut HashMap<u64, usize>) {
-    for &id in windows {
-        if let Some(col) = window_column(state, id) {
-            cache.insert(id, col);
-        }
-    }
-}
-
-/// Re-derive and apply the column-widths rule for whatever count is
-/// currently on this workspace. Purely positional -- no history. Safe to
-/// call repeatedly; re-applying the same width is a no-op.
 fn reconcile(
     action_socket: &mut Socket,
-    state: &EventStreamState,
     outputs: &HashMap<String, Output>,
     config: &column_widths_mode::ColumnWidthsConfig,
     paused: &Arc<AtomicBool>,
@@ -92,16 +58,18 @@ fn reconcile(
     if paused.load(Ordering::SeqCst) {
         return;
     }
-    if !config.applies_to(workspace_output(state, ws).as_deref(), outputs) {
+
+    let output_name = column_widths_mode::workspace_output(action_socket, ws).unwrap_or(None);
+    if !config.applies_to(output_name.as_deref(), outputs) {
         return;
     }
 
-    let sorted = column_widths_mode::columns_by_position(state, windows);
+    let sorted =
+        column_widths_mode::columns_by_position(action_socket, windows).unwrap_or_default();
+
+    dbg!(&sorted);
     let num_windows = sorted.len();
-    log::debug!("windows: {}, sorted: {}", windows.len(), sorted.len());
-    if num_windows < 1 {
-        return;
-    }
+    log::debug!("windows: {:?}, sorted: {:?}", windows, sorted);
 
     match num_windows {
         0 => {}
@@ -149,7 +117,8 @@ fn main() {
 
     // Create (if needed) and acquire lockfile
     // Exit if there's already an instance running
-    // or if there was an issue creating or acquiring the lockfile (e.g. permission issue)
+    // or if there was an issue creating or acquiring the lockfile (e.g.
+    // permission issue)
     let _lockfile = lockfile::acquire_lockfile().unwrap_or_else(|error| {
         error!("{error:?}");
         process::exit(1);
@@ -178,16 +147,14 @@ fn main() {
         }
     });
 
-    // Initialize connections to niri IPC socket, start the event stream and gather events
+    // Initialize connections to niri IPC socket, start the event stream and
+    // gather events
     let (event_socket, mut action_socket) = socket_connections::init_socket_connections()
         .unwrap_or_else(|error| {
             error!("{error:?}");
             process::exit(2);
         });
 
-    // Gather state and create an outputs map
-    // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
-    let mut state = EventStreamState::default();
     let outputs: HashMap<String, Output> =
         outputs_map::init_outputs_map(&mut action_socket, &config).unwrap_or_else(|error| {
             error!("{error:?}");
@@ -201,35 +168,24 @@ fn main() {
             process::exit(4);
         });
 
-    // Track windows that have moved workspaces until their tile size is properly recalculated
-    // in the "WindowLayoutsChanged" event
-    // This avoids comparing a window's old layout size against its new workspace output's resolution
-    // See https://github.com/Antiz96/oniri/issues/79 for details
+    // Track windows that have moved workspaces until their tile size is
+    // properly recalculated in the "WindowLayoutsChanged" event
+    // This avoids comparing a window's old layout size against its new
+    // workspace output's resolution See https://github.com/Antiz96/oniri/issues/79 for details
     // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
     let mut moved_windows_map = HashMap::<u64, u64>::new();
-
-    // column-widths mode only: last-seen column index per window, used to
-    // tell a genuine column move apart from a mere resize (including our
-    // own) in WindowLayoutsChanged -- see reconcile_duo_trio's call site.
-    let mut last_known_columns: HashMap<u64, usize> = HashMap::new();
-    for windows in workspace_windows.values() {
-        seed_column_cache(&state, windows, &mut last_known_columns);
-    }
 
     // Read events gathered from the IPC socket
     let mut read_event = event_socket.read_events();
 
     // Loop over events
     while let Ok(event) = read_event() {
-        // Update state
-        // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
-        state.apply(event.clone());
-
         // Filter events
         match event {
             // Window being opened
             Event::WindowOpenedOrChanged { window } => {
-                // Skip floating windows (they cannot/should not be maximized or width-managed)
+                // Skip floating windows (they cannot/should not be maximized or
+                // width-managed)
                 if window.is_floating {
                     continue;
                 }
@@ -241,14 +197,17 @@ fn main() {
                     continue;
                 };
 
-                // Workaround IPC limitation by checking if the window that triggered the event is
-                // in the same workspace.
+                // Workaround IPC limitation by checking if the window that
+                // triggered the event is in the same workspace.
                 //
-                // If not, track the previous workspace to act on it (if needed), for instance if the current
-                // window is moved to another workspace and there's only one window remaining on the
-                // previous one (which should therefore be maximized).
+                // If not, track the previous workspace to act on it (if
+                // needed), for instance if the current
+                // window is moved to another workspace and there's only one
+                // window remaining on the previous one (which
+                // should therefore be maximized).
                 //
-                // This will differentiate between WindowOpened and WindowChanged.
+                // This will differentiate between WindowOpened and
+                // WindowChanged.
                 let previous_ws = workspace_windows
                     .iter()
                     .find_map(|(&tracked_ws, windows)| windows.contains(&id).then_some(tracked_ws));
@@ -264,57 +223,51 @@ fn main() {
 
                 let windows = workspace_windows.entry(ws).or_default();
                 windows.push(id);
-                let windows_snapshot = windows.clone();
 
-                if windows_snapshot.len() > 4 {
-                    if config.applies_to(workspace_output(&state, ws).as_deref(), &outputs)
-                        && !paused.load(Ordering::SeqCst)
+                if windows.len() > 4 {
+                    if config.applies_to(
+                        workspace_output(&mut action_socket, ws)
+                            .unwrap_or_default()
+                            .as_deref(),
+                        &outputs,
+                    ) && !paused.load(Ordering::SeqCst)
                     {
                         column_widths_mode::set_new_window_default(
                             &mut action_socket,
-                            windows_snapshot.len(),
+                            windows.len(),
                             id,
                         )
                         .unwrap_or_else(|error| error!("{error:?}"));
                     }
                 } else {
-                    reconcile(
-                        &mut action_socket,
-                        &state,
-                        &outputs,
-                        &config,
-                        &paused,
-                        ws,
-                        &windows_snapshot,
-                    );
-                    seed_column_cache(&state, &windows_snapshot, &mut last_known_columns);
+                    reconcile(&mut action_socket, &outputs, &config, &paused, ws, windows);
                 }
 
-                // If the window that triggered the event has been moved to another workspace:
+                // If the window that triggered the event has been moved to
+                // another workspace:
                 if let Some(old_ws) = previous_ws
                     && old_ws != ws
                 {
-                    if let Some(old_windows) = workspace_windows.get(&old_ws) {
-                        let old_windows = old_windows.clone();
-                        if old_windows.len() <= 4 {
-                            reconcile(
-                                &mut action_socket,
-                                &state,
-                                &outputs,
-                                &config,
-                                &paused,
-                                old_ws,
-                                &old_windows,
-                            );
-                            seed_column_cache(&state, &old_windows, &mut last_known_columns);
-                        }
-                        // still >4 after losing one: nothing to do, matches the "leave existing untouched" rule
+                    if let Some(old_windows) = workspace_windows.get(&old_ws)
+                        && old_windows.len() <= 4
+                    {
+                        reconcile(
+                            &mut action_socket,
+                            &outputs,
+                            &config,
+                            &paused,
+                            old_ws,
+                            old_windows,
+                        );
                     }
+                    // still >4 after losing one: nothing to do, matches the
+                    // "leave existing untouched" rule
 
-                    // Track windows that have moved workspaces until their tile size is properly recalculated
+                    // Track windows that have moved workspaces until their tile
+                    // size is properly recalculated
                     // in the "WindowLayoutsChanged" event
-                    // This avoids comparing a window's old layout size against its new workspace output's resolution
-                    // See https://github.com/Antiz96/oniri/issues/79 for details
+                    // This avoids comparing a window's old layout size against
+                    // its new workspace output's resolution See https://github.com/Antiz96/oniri/issues/79 for details
                     // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
                     moved_windows_map.insert(id, old_ws);
                 }
@@ -334,19 +287,8 @@ fn main() {
                 // Update the workspace vector
                 windows.retain(|&wid| wid != id);
 
-                last_known_columns.remove(&id);
-                let windows_snapshot = windows.clone();
-                if windows_snapshot.len() <= 4 {
-                    reconcile(
-                        &mut action_socket,
-                        &state,
-                        &outputs,
-                        &config,
-                        &paused,
-                        ws,
-                        &windows_snapshot,
-                    );
-                    seed_column_cache(&state, &windows_snapshot, &mut last_known_columns);
+                if windows.len() <= 4 {
+                    reconcile(&mut action_socket, &outputs, &config, &paused, ws, windows);
                 }
             }
             // Ignore other events
