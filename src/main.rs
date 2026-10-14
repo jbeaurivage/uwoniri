@@ -22,7 +22,11 @@ use config::Config;
 /// Dynamically resize windows on ultrawide monitors
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
-struct Args;
+struct Args {
+    /// Dynamically retile as windows are added or removed in the workspade (disabled by default)
+    #[arg(short, long, default_value_t = false)]
+    dynamic: bool,
+}
 
 /// Log a failed operation without aborting the event loop.
 fn log_failure(result: Result<()>) {
@@ -126,13 +130,13 @@ impl Daemon {
     }
 }
 
-fn run() -> Result<()> {
+fn run(start_paused: bool) -> Result<()> {
     // Exit if there's already an instance running or the lockfile can't be
     // created or acquired (e.g. permission issue).
     let _lockfile = lockfile::acquire_lockfile()?;
 
     let config = Config::load();
-    let paused = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(start_paused));
 
     // Connect to the niri IPC socket and start the event stream.
     let (event_socket, action_socket) = ipc::init_socket_connections()?;
@@ -161,11 +165,13 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    let _args = Args::parse();
+    let args = Args::parse();
 
     env_logger::init();
 
-    if let Err(err) = run() {
+    let start_paused = !args.dynamic;
+
+    if let Err(err) = run(start_paused) {
         error!("{}", report(&err));
         process::exit(1);
     }
