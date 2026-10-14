@@ -1,18 +1,36 @@
 {
-  description = "oniri - a tool that automatically maximizes the only window of a niri workspace";
-  inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-  };
+  description = "uwoniri: Dynamically resize windows on ultrawide monitors";
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
   outputs =
     { self, nixpkgs }:
     let
-      supportedSystems = [ "x86_64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-      pkgsFor = nixpkgs.legacyPackages;
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
-      packages = forAllSystems (system: {
-        default = pkgsFor.${system}.callPackage ./default.nix { };
+      packages = forAllSystems (pkgs: rec {
+        uwoniri = pkgs.callPackage ./package.nix { };
+        default = uwoniri;
+      });
+
+      overlays.default = final: _prev: {
+        uwoniri = final.callPackage ./package.nix { };
+      };
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          packages = with pkgs; [
+            rust-analyzer
+            clippy
+            rustfmt
+          ];
+        };
       });
     };
 }

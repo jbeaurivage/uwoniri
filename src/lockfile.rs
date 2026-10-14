@@ -1,45 +1,42 @@
 //! Create (if needed) and acquire lockfile
 //! in order to prevent multiple instances to run at the same time
 
-use anyhow::{Context, anyhow};
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 
+use crate::error::{Error, Result};
+
 const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
 
-pub fn acquire_lockfile() -> anyhow::Result<File> {
+pub fn acquire_lockfile() -> Result<File> {
     // Create oniri cachedir (if it doesn't exist)
     let cachedir = dirs::cache_dir()
-        .context("Failed to determine the cache directory")?
+        .ok_or(Error::NoDir("cache"))?
         .join(PACKAGE_NAME);
 
-    fs::create_dir_all(&cachedir).with_context(|| {
-        format!(
-            "Failed to create the {} cache directory",
-            cachedir.display()
-        )
+    fs::create_dir_all(&cachedir).map_err(|source| Error::CreateCacheDir {
+        path: cachedir.clone(),
+        source,
     })?;
 
-    let lockfile_path = cachedir.join(format!("{PACKAGE_NAME}.lock"));
+    let path = cachedir.join(format!("{PACKAGE_NAME}.lock"));
 
     let lockfile = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&lockfile_path)
-        .with_context(|| format!("Failed to open the {} lockfile", lockfile_path.display()))?;
+        .open(&path)
+        .map_err(|source| Error::OpenLockfile {
+            path: path.clone(),
+            source,
+        })?;
 
-    lockfile.try_lock_exclusive().map_err(|error| {
-        if error.kind() == ErrorKind::WouldBlock {
-            anyhow!(error).context(format!(
-                "Another instance of {PACKAGE_NAME} is already running"
-            ))
+    lockfile.try_lock_exclusive().map_err(|source| {
+        if source.kind() == ErrorKind::WouldBlock {
+            Error::AlreadyRunning(PACKAGE_NAME)
         } else {
-            anyhow!(error).context(format!(
-                "Failed to acquire lock on the {} lockfile",
-                lockfile_path.display()
-            ))
+            Error::AcquireLock { path, source }
         }
     })?;
 

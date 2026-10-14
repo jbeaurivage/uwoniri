@@ -1,29 +1,57 @@
-//! Create a workspace/window(s) map and initialize it
-use anyhow::Context;
-use niri_ipc::{Request, Response, socket::Socket};
+//! Tracks which tiled windows live on which workspace.
+
+use niri_ipc::{Request, Response};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-pub fn init_windows_map(action_socket: &mut Socket) -> anyhow::Result<HashMap<u64, Vec<u64>>> {
-    let response = action_socket
-        .send(Request::Windows)
-        .context("Failed to get windows list")?;
+use crate::error::Result;
+use crate::ipc::{self, ActionSocket};
 
-    let Ok(Response::Windows(windows)) = response else {
-        return Ok(HashMap::new());
-    };
+#[derive(Default)]
+pub struct WindowMap(HashMap<u64, Vec<u64>>);
 
-    let mut workspace_windows: HashMap<u64, Vec<u64>> = HashMap::new();
+impl WindowMap {
+    /// Build the map from the windows niri currently reports.
+    pub fn init(socket: Arc<Mutex<ActionSocket>>) -> Result<Self> {
+        let response = socket.lock().unwrap().request(Request::Windows)?;
+        let windows = match response {
+            Response::Windows(windows) => windows,
+            other => return Err(ipc::unexpected(other)),
+        };
 
-    for window in windows {
-        // Skip floating windows (they cannot/should not be maximized)
-        if window.is_floating {
-            continue;
+        let mut map = Self::default();
+        // Floating windows cannot/should not be width-managed.
+        for window in windows.iter().filter(|w| !w.is_floating) {
+            if let Some(ws) = window.workspace_id {
+                map.0.entry(ws).or_default().push(window.id);
+            }
         }
-
-        if let Some(ws) = window.workspace_id {
-            workspace_windows.entry(ws).or_default().push(window.id);
-        }
+        Ok(map)
     }
 
-    Ok(workspace_windows)
+    pub fn workspace_of(&self, id: u64) -> Option<u64> {
+        self.0
+            .iter()
+            .find_map(|(&ws, ids)| ids.contains(&id).then_some(ws))
+    }
+
+    /// Track `id` on `ws`; returns the workspace it was on before, if any.
+    pub fn place(&mut self, id: u64, ws: u64) -> Option<u64> {
+        let previous = self.remove(id);
+        self.0.entry(ws).or_default().push(id);
+        previous
+    }
+
+    /// Stop tracking `id`; returns the workspace it was on, if any.
+    pub fn remove(&mut self, id: u64) -> Option<u64> {
+        let ws = self.workspace_of(id)?;
+        if let Some(ids) = self.0.get_mut(&ws) {
+            ids.retain(|&other| other != id);
+        }
+        Some(ws)
+    }
+
+    pub fn windows(&self, ws: u64) -> &[u64] {
+        self.0.get(&ws).map(Vec::as_slice).unwrap_or_default()
+    }
 }
