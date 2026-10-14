@@ -1,7 +1,6 @@
 use clap::Parser;
 use log::{debug, error};
-use niri_ipc::{Event, Output, Window};
-use std::collections::HashMap;
+use niri_ipc::{Event, Window};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +15,6 @@ mod ipc;
 mod layout;
 mod listener;
 mod lockfile;
-mod outputs_map;
 mod windows_map;
 
 use config::Config;
@@ -35,7 +33,6 @@ fn log_failure(result: Result<()>) {
 
 struct Daemon {
     socket: Arc<Mutex<ActionSocket>>,
-    outputs: HashMap<String, Output>,
     config: Config,
     paused: Arc<AtomicBool>,
     windows: WindowMap,
@@ -57,7 +54,14 @@ impl Daemon {
         let socket = &mut *guard;
 
         let output = layout::workspace_output(socket, ws)?;
-        if !self.config.applies_to(output.as_deref(), &self.outputs) {
+
+        // Only ask niri for the output size if the config actually uses it.
+        let width = match (&output, self.config.min_width) {
+            (Some(name), Some(_)) => layout::output_width(socket, name)?,
+            _ => None,
+        };
+
+        if !self.config.applies_to(output.as_deref(), width) {
             return Ok(());
         }
 
@@ -134,7 +138,6 @@ fn run() -> Result<()> {
     let (event_socket, action_socket) = ipc::init_socket_connections()?;
     let socket = Arc::new(Mutex::new(action_socket));
 
-    let outputs = outputs_map::init_outputs_map(socket.clone(), &config)?;
     let windows = WindowMap::init(socket.clone())?;
 
     // Command listener (pause / unpause / retile).
@@ -142,7 +145,6 @@ fn run() -> Result<()> {
 
     let mut daemon = Daemon {
         socket,
-        outputs,
         config,
         paused,
         windows,

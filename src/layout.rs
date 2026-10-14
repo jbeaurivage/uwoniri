@@ -30,6 +30,17 @@ pub fn workspace_output(socket: &mut ActionSocket, ws: u64) -> Result<Option<Str
         .and_then(|w| w.output))
 }
 
+/// Logical width of the named output, if niri reports one.
+pub fn output_width(socket: &mut ActionSocket, name: &str) -> Result<Option<i32>> {
+    match socket.request(Request::Outputs)? {
+        Response::Outputs(outputs) => Ok(outputs
+            .get(name)
+            .and_then(|o| o.logical.as_ref())
+            .map(|l| l.width as i32)),
+        other => Err(ipc::unexpected(other)),
+    }
+}
+
 /// Given a workspace's tracked window ids, return them sorted left-to-right
 /// by column position
 pub fn columns_by_position(socket: &mut ActionSocket, windows: &[u64]) -> Result<Vec<u64>> {

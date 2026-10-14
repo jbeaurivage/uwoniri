@@ -1,7 +1,6 @@
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{io, path::PathBuf};
 
 use log::{debug, error, info};
-use niri_ipc::Output;
 use serde::Deserialize;
 
 use crate::error::{self, Error, Result};
@@ -178,7 +177,8 @@ impl Config {
     }
 
     /// Whether column-widths behavior should run for this output.
-    pub fn applies_to(&self, output_name: Option<&str>, outputs: &HashMap<String, Output>) -> bool {
+    /// `logical_width` is only consulted for `min_width`.
+    pub fn applies_to(&self, output_name: Option<&str>, logical_width: Option<i32>) -> bool {
         if self.outputs.is_empty() && self.min_width.is_none() {
             return true; // unrestricted
         }
@@ -191,15 +191,6 @@ impl Config {
             return true;
         }
 
-        if let Some(min_w) = self.min_width
-            && let Some(width) = outputs
-                .get(name)
-                .and_then(|o| o.logical.as_ref())
-                .map(|l| l.width as i32)
-        {
-            return width >= min_w;
-        }
-
-        false
+        matches!((self.min_width, logical_width), (Some(min), Some(w)) if w >= min)
     }
 }
