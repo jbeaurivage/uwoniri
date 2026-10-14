@@ -1,39 +1,27 @@
-//! Oniri - A tool that automatically maximizes the only window of a niri
-//! workspace.
-//!
-//! It relies on the niri IPC to verify if a window is the only one of a
-//! workspace, whether it's the first one opened or the last remaining ones
-//! after all the other windows got closed, and maximize it if so.
-//!
-//! FORK NOTE: added `-C` / `--column-widths` mode, which repurposes the same
-//! per-workspace window tracking to manage column widths for an
-//! ultrawide-style layout instead of maximizing. See column_widths_mode.rs.
-//! This mode is purely positional (re-derives left/center/right from
-//! niri's own column data on every relevant event) rather than tracking
-//! "master" identity across transitions, and can be paused/resumed by
-//! sending SIGUSR1 to the process (e.g. from a niri keybind).
-
 use clap::Parser;
 use log::{debug, error, info};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Output};
-use signal_hook::consts::SIGUSR1;
-use signal_hook::iterator::Signals;
 use std::collections::HashMap;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::column_widths_mode::workspace_output;
+use crate::windows::workspace_output;
 
-mod column_widths_mode;
+mod config;
+mod error;
 mod help;
+mod ipc;
 mod lockfile;
 mod outputs_map; // https://github.com/Antiz96/oniri/issues/3
 mod socket_connections;
 mod version;
-mod window;
+mod windows;
 mod windows_map;
+
+use crate::error::{Error, report};
+use config::Config;
 
 // Arguments definition
 #[derive(Parser)]
@@ -50,7 +38,7 @@ struct Args {
 fn reconcile(
     action_socket: &mut Socket,
     outputs: &HashMap<String, Output>,
-    config: &column_widths_mode::ColumnWidthsConfig,
+    config: &Config,
     paused: &Arc<AtomicBool>,
     ws: u64,
     windows: &[u64],
@@ -59,13 +47,12 @@ fn reconcile(
         return;
     }
 
-    let output_name = column_widths_mode::workspace_output(action_socket, ws).unwrap_or(None);
+    let output_name = windows::workspace_output(action_socket, ws).unwrap_or(None);
     if !config.applies_to(output_name.as_deref(), outputs) {
         return;
     }
 
-    let sorted =
-        column_widths_mode::columns_by_position(action_socket, windows).unwrap_or_default();
+    let sorted = windows::columns_by_position(action_socket, windows).unwrap_or_default();
 
     dbg!(&sorted);
     let num_windows = sorted.len();
@@ -74,24 +61,19 @@ fn reconcile(
     match num_windows {
         0 => {}
         1 => {
-            column_widths_mode::set_sole(action_socket, sorted[0])
-                .unwrap_or_else(|error| error!("{error:?}"));
+            windows::set_sole(action_socket, sorted[0]).unwrap_or_else(|error| error!("{error:?}"));
         }
         2 => {
-            column_widths_mode::set_duo(action_socket, sorted[0], sorted[1])
+            windows::set_duo(action_socket, sorted[0], sorted[1])
                 .unwrap_or_else(|error| error!("{error:?}"));
         }
         3 => {
-            column_widths_mode::set_trio(action_socket, sorted[0], sorted[1], sorted[2])
+            windows::set_trio(action_socket, sorted[0], sorted[1], sorted[2])
                 .unwrap_or_else(|error| error!("{error:?}"));
         }
         _ => {
-            column_widths_mode::set_new_window_default(
-                action_socket,
-                num_windows,
-                *sorted.last().unwrap(),
-            )
-            .unwrap_or_else(|error| error!("{error:?}"));
+            windows::set_new_window_default(action_socket, num_windows, *sorted.last().unwrap())
+                .unwrap_or_else(|error| error!("{error:?}"));
         }
     }
 }
@@ -124,7 +106,7 @@ fn main() {
         process::exit(1);
     });
 
-    let config = column_widths_mode::ColumnWidthsConfig::load();
+    let config = Config::load();
     let paused = Arc::new(AtomicBool::new(false));
 
     let paused_for_signal = Arc::clone(&paused);
@@ -167,13 +149,6 @@ fn main() {
             error!("{error:?}");
             process::exit(4);
         });
-
-    // Track windows that have moved workspaces until their tile size is
-    // properly recalculated in the "WindowLayoutsChanged" event
-    // This avoids comparing a window's old layout size against its new
-    // workspace output's resolution See https://github.com/Antiz96/oniri/issues/79 for details
-    // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
-    let mut moved_windows_map = HashMap::<u64, u64>::new();
 
     // Read events gathered from the IPC socket
     let mut read_event = event_socket.read_events();
@@ -232,12 +207,8 @@ fn main() {
                         &outputs,
                     ) && !paused.load(Ordering::SeqCst)
                     {
-                        column_widths_mode::set_new_window_default(
-                            &mut action_socket,
-                            windows.len(),
-                            id,
-                        )
-                        .unwrap_or_else(|error| error!("{error:?}"));
+                        windows::set_new_window_default(&mut action_socket, windows.len(), id)
+                            .unwrap_or_else(|error| error!("{error:?}"));
                     }
                 } else {
                     reconcile(&mut action_socket, &outputs, &config, &paused, ws, windows);
@@ -247,30 +218,20 @@ fn main() {
                 // another workspace:
                 if let Some(old_ws) = previous_ws
                     && old_ws != ws
+                    && let Some(old_windows) = workspace_windows.get(&old_ws)
+                    && old_windows.len() <= 4
                 {
-                    if let Some(old_windows) = workspace_windows.get(&old_ws)
-                        && old_windows.len() <= 4
-                    {
-                        reconcile(
-                            &mut action_socket,
-                            &outputs,
-                            &config,
-                            &paused,
-                            old_ws,
-                            old_windows,
-                        );
-                    }
-                    // still >4 after losing one: nothing to do, matches the
-                    // "leave existing untouched" rule
-
-                    // Track windows that have moved workspaces until their tile
-                    // size is properly recalculated
-                    // in the "WindowLayoutsChanged" event
-                    // This avoids comparing a window's old layout size against
-                    // its new workspace output's resolution See https://github.com/Antiz96/oniri/issues/79 for details
-                    // This can be dropped once https://github.com/Antiz96/oniri/issues/3 is resolved
-                    moved_windows_map.insert(id, old_ws);
+                    reconcile(
+                        &mut action_socket,
+                        &outputs,
+                        &config,
+                        &paused,
+                        old_ws,
+                        old_windows,
+                    );
                 }
+                // still >4 after losing one: nothing to do, matches the
+                // "leave existing untouched" rule
             }
 
             // Window being closed

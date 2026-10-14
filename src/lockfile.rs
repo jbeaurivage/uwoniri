@@ -6,11 +6,13 @@ use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 
+const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+
 pub fn acquire_lockfile() -> anyhow::Result<File> {
     // Create oniri cachedir (if it doesn't exist)
     let cachedir = dirs::cache_dir()
         .context("Failed to determine the cache directory")?
-        .join("oniri");
+        .join(PACKAGE_NAME);
 
     fs::create_dir_all(&cachedir).with_context(|| {
         format!(
@@ -19,7 +21,7 @@ pub fn acquire_lockfile() -> anyhow::Result<File> {
         )
     })?;
 
-    let lockfile_path = cachedir.join("oniri.lock");
+    let lockfile_path = cachedir.join(format!("{PACKAGE_NAME}.lock"));
 
     let lockfile = OpenOptions::new()
         .create(true)
@@ -30,7 +32,9 @@ pub fn acquire_lockfile() -> anyhow::Result<File> {
 
     lockfile.try_lock_exclusive().map_err(|error| {
         if error.kind() == ErrorKind::WouldBlock {
-            anyhow!(error).context("Another instance of Oniri is already running")
+            anyhow!(error).context(format!(
+                "Another instance of {PACKAGE_NAME} is already running"
+            ))
         } else {
             anyhow!(error).context(format!(
                 "Failed to acquire lock on the {} lockfile",

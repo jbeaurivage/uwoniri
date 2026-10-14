@@ -15,7 +15,6 @@ log = "0.4.29"
 niri-ipc = "26.0.0"
 phf = { version = "0.14.0", features = ["macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
-signal-hook = "0.4.4"
 thiserror = "2.0.21"
 toml = "1.1.6"
 

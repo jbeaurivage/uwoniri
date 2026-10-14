@@ -1,13 +1,7 @@
 use anyhow::Context;
 use log::{debug, info};
-use niri_ipc::{Action, Output, Request, Response, SizeChange, Window, Workspace, socket::Socket};
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use niri_ipc::{Action, Request, Response, SizeChange, Window, Workspace, socket::Socket};
 
-/// Ground-truth window list, straight from niri -- not a locally mirrored
-/// copy. Mirrored state is what caused the stale-order bug a few messages
-/// back; querying live avoids that class of problem entirely.
 fn query_windows(socket: &mut Socket) -> anyhow::Result<Vec<Window>> {
     match socket
         .send(Request::Windows)
@@ -36,7 +30,7 @@ fn query_workspaces(socket: &mut Socket) -> anyhow::Result<Vec<Workspace>> {
     }
 }
 
-/// Which output a workspace currently lives on -- queried live.
+/// Which output a workspace currently lives on
 pub fn workspace_output(socket: &mut Socket, ws: u64) -> anyhow::Result<Option<String>> {
     Ok(query_workspaces(socket)?
         .into_iter()
@@ -45,7 +39,7 @@ pub fn workspace_output(socket: &mut Socket, ws: u64) -> anyhow::Result<Option<S
 }
 
 /// Given a workspace's tracked window ids, return them sorted left-to-right
-/// by column position -- queried live, same reasoning as above.
+/// by column position
 pub fn columns_by_position(socket: &mut Socket, windows: &[u64]) -> anyhow::Result<Vec<u64>> {
     let mut with_col: Vec<(usize, u64)> = query_windows(socket)?
         .into_iter()
@@ -120,7 +114,6 @@ fn center_column(socket: &mut Socket) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Solo window: 50% wide, centered.
 pub fn set_sole(socket: &mut Socket, window_id: u64) -> anyhow::Result<()> {
     let master_width = width_config(1).0;
 
@@ -130,8 +123,6 @@ pub fn set_sole(socket: &mut Socket, window_id: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Two windows: `left` (by column position) is master at 50% + centered
-/// (last action); `right` gets 25%, resized first.
 pub fn set_duo(socket: &mut Socket, left: u64, right: u64) -> anyhow::Result<()> {
     let width_config = width_config(2);
     let master_width = width_config.0;
@@ -148,8 +139,6 @@ pub fn set_duo(socket: &mut Socket, left: u64, right: u64) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Three windows: `center` (the spatially middle column) gets 40% +
-/// centered (last action); `left`/`right` get 30% each, resized first.
 pub fn set_trio(socket: &mut Socket, left: u64, center: u64, right: u64) -> anyhow::Result<()> {
     let width_config = width_config(3);
     let master_width = width_config.0;
@@ -168,8 +157,6 @@ pub fn set_trio(socket: &mut Socket, left: u64, center: u64, right: u64) -> anyh
     Ok(())
 }
 
-/// Beyond the baseline transition: only the brand-new window gets
-/// defaulted to 33%; existing columns are left exactly as they are.
 pub fn set_new_window_default(
     socket: &mut Socket,
     num_windows: usize,
@@ -180,87 +167,4 @@ pub fn set_new_window_default(
     set_window_width(socket, new_window_id, default_width)?;
     info!("[column-widths] new window {new_window_id} defaulted to {default_width}%");
     Ok(())
-}
-
-// ---------------------------------------------------------------------
-// Config: scope column-widths mode to specific outputs and/or a minimum
-// display width. Absent file, or a file with neither field set, means
-// "apply everywhere" -- the original unscoped behavior.
-// ---------------------------------------------------------------------
-
-/// ~/.config/oniri/column-widths.toml (honors $XDG_CONFIG_HOME):
-///
-/// ```toml
-/// outputs = ["DP-2"]   # optional: connector names this applies to
-/// min_width = 3440     # optional: OR apply on any output at least this
-///                       # many logical pixels wide
-/// ```
-///
-/// If both are set, an output qualifies by matching EITHER condition.
-#[derive(Debug, Deserialize, Default)]
-pub struct ColumnWidthsConfig {
-    #[serde(default)]
-    pub outputs: Vec<String>,
-    pub min_width: Option<i32>,
-}
-
-impl ColumnWidthsConfig {
-    fn config_path() -> anyhow::Result<PathBuf> {
-        Ok(dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Failed to determine the config directory"))?
-            .join("oniri")
-            .join("column-widths.toml"))
-    }
-
-    pub fn load() -> Self {
-        let path = Self::config_path().unwrap();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => match toml::from_str::<Self>(&contents) {
-                Ok(cfg) => {
-                    info!("[column-widths] loaded config from {}", path.display());
-                    cfg
-                }
-                Err(error) => {
-                    log::error!(
-                        "[column-widths] failed to parse {}: {error}; applying to all outputs",
-                        path.display()
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => {
-                log::debug!(
-                    "[column-widths] no config at {} -- applying to all outputs",
-                    path.display()
-                );
-                Self::default()
-            }
-        }
-    }
-
-    /// Whether column-widths behavior should run for this output.
-    pub fn applies_to(&self, output_name: Option<&str>, outputs: &HashMap<String, Output>) -> bool {
-        if self.outputs.is_empty() && self.min_width.is_none() {
-            return true; // unrestricted
-        }
-
-        let Some(name) = output_name else {
-            return false;
-        };
-
-        if self.outputs.iter().any(|o| o == name) {
-            return true;
-        }
-
-        if let Some(min_w) = self.min_width
-            && let Some(width) = outputs
-                .get(name)
-                .and_then(|o| o.logical.as_ref())
-                .map(|l| l.width as i32)
-        {
-            return width >= min_w;
-        }
-
-        false
-    }
 }
