@@ -6,11 +6,11 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use clap::ValueEnum;
 use log::{debug, error, info, warn};
 
 use crate::config::Widths;
@@ -18,21 +18,48 @@ use crate::error::{Error, Result, report};
 use crate::ipc::ActionSocket;
 use crate::layout;
 
-enum Command {
+/// Commands the daemon understands. The wire format is the lowercase variant
+/// name (`pause`, `unpause`, `retile`), one per line.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Command {
+    /// Stop adjusting layouts until unpaused
     Pause,
+    /// Resume adjusting layouts
     Unpause,
+    /// Make the focused window the master and re-width the others
     Retile,
 }
 
-impl FromStr for Command {
-    type Err = String;
+impl Command {
+    /// Client side: send `cmd` to the running daemon and wait for its reply.
+    pub fn send(&self) -> Result<()> {
+        let path = socket_path()?;
+        let mut stream = UnixStream::connect(&path).map_err(|source| Error::ControlConnect {
+            path: path.clone(),
+            source,
+        })?;
+        // A retile waits on niri, so allow for some latency.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(Error::ControlIo)?;
 
-    fn from_str(s: &str) -> std::result::Result<Self, String> {
-        match s.trim() {
-            "pause" => Ok(Self::Pause),
-            "unpause" => Ok(Self::Unpause),
-            "retile" => Ok(Self::Retile),
-            other => Err(format!("unknown command {other:?}")),
+        let name = self
+            .to_possible_value()
+            .expect("no skipped variants")
+            .get_name()
+            .to_owned();
+        writeln!(stream, "{name}").map_err(Error::ControlIo)?;
+
+        let mut reply = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut reply)
+            .map_err(Error::ControlIo)?;
+
+        match reply.trim() {
+            "ok" => Ok(()),
+            other => Err(Error::ControlRejected(
+                other.strip_prefix("error: ").unwrap_or(other).to_owned(),
+            )),
         }
     }
 }
@@ -86,7 +113,7 @@ fn handle(
 ) {
     let outcome = read_line(&stream)
         .map_err(|err| format!("failed to read command: {err}"))
-        .and_then(|line| line.parse::<Command>())
+        .and_then(|line| Command::from_str(line.trim(), false))
         .and_then(|cmd| run(cmd, paused, socket, width_config).map_err(|err| report(&err)));
 
     let reply = match outcome {

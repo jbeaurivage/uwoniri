@@ -21,11 +21,21 @@ use config::Config;
 
 /// Dynamically resize windows on ultrawide monitors
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
-    /// Dynamically retile as windows are added or removed in the workspade (disabled by default)
+    /// Dynamically retile as windows are added or removed in the workspade
+    /// (disabled by default)
     #[arg(short, long, default_value_t = false)]
     dynamic: bool,
+
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Send a command to the running uwoniri instance
+    Msg { command: listener::Command },
 }
 
 /// Log a failed operation without aborting the event loop.
@@ -167,6 +177,13 @@ fn run(start_paused: bool) -> Result<()> {
 fn main() {
     let args = Args::parse();
 
+    if let Some(Cmd::Msg { command }) = args.command {
+        if let Err(err) = command.send() {
+            eprintln!("uwoniri: {}", report(&err));
+            process::exit(1);
+        }
+        return;
+    }
     env_logger::init();
 
     let start_paused = !args.dynamic;

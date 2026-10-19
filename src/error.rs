@@ -72,6 +72,19 @@ pub enum Error {
 
     #[error("error occured")]
     Anyhow(#[from] anyhow::Error),
+
+    #[error("failed to connect to control socket {} (is the daemon running?)", path.display())]
+    ControlConnect {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("control socket I/O failed")]
+    ControlIo(#[source] io::Error),
+
+    #[error("daemon rejected the command: {0}")]
+    ControlRejected(String),
 }
 
 /// Render an error together with its chain of sources on one line
