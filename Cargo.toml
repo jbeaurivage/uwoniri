@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jbeaurivage/uwoniri"
-description = "Dynamically resize windows in a niri workspace on ultrawide monitors"
+description = "Dynamic window resizing for niri on ultrawide monitors"
 
 [dependencies]
 anyhow = "1.0.102"

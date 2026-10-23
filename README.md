@@ -1,6 +1,6 @@
 # uwoniri
 
-Sensible window widths for [niri](https://github.com/YaLTeR/niri) on ultrawide monitors.
+Dynamic window resizing for [niri](https://github.com/YaLTeR/niri) on ultrawide monitors
 
 By default, niri sets the width of every new window to a static, predefined width. This usually works great on a standard width monitor. On ultrawide monitors, it can quickly become awkward:
 as windows are added and removed, their distribution can become lopsided across the monitor and way off the user's central field of view, requiring them to constantly resize and center the columns.

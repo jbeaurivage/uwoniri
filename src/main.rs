@@ -19,7 +19,7 @@ mod windows_map;
 
 use config::Config;
 
-/// Dynamically resize windows in a niri workspace on ultrawide monitors
+/// Dynamic window resizing for niri on ultrawide monitors
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
