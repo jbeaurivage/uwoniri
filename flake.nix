@@ -1,5 +1,5 @@
 {
-  description = "uwoniri: Dynamically resize windows on ultrawide monitors";
+  description = "uwoniri: Dynamic window resizing for niri on ultrawide monitors";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
