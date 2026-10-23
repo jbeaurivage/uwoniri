@@ -154,7 +154,7 @@ pub fn set_layout(socket: &mut ActionSocket, sorted: &[u64], widths: &Widths) ->
             }
         }
     }
-    set_window_width_settled(socket, master, layout.master)?;
+    set_window_width_settled(socket, master, layout.main)?;
 
     // Centering acts on the focused column; a lone window is already focused.
     if n > 1 {
@@ -164,7 +164,7 @@ pub fn set_layout(socket: &mut ActionSocket, sorted: &[u64], widths: &Widths) ->
 
     info!(
         "{n} windows: master {master} ({}%), others {:?}%",
-        layout.master, layout.side
+        layout.main, layout.side
     );
     Ok(())
 }
@@ -226,7 +226,7 @@ pub fn retile(socket: &mut ActionSocket, width_config: &Widths) -> Result<()> {
     // Beyond the managed count, a focused window at either end isn't centered.
     let at_edge = n > max && (pos == 0 || pos == n - 1);
 
-    set_window_width_settled(socket, focused, layout.master)?;
+    set_window_width_settled(socket, focused, layout.main)?;
 
     for (i, &id) in sorted.iter().enumerate() {
         if id == focused {

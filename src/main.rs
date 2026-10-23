@@ -19,7 +19,7 @@ mod windows_map;
 
 use config::Config;
 
-/// Dynamically resize windows on ultrawide monitors
+/// Dynamically resize windows in a niri workspace on ultrawide monitors
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -70,12 +70,10 @@ impl Daemon {
         let output = layout::workspace_output(socket, ws)?;
 
         // Only ask niri for the output size if the config actually uses it.
-        let width = match (&output, self.config.min_width) {
-            (Some(name), Some(_)) => layout::output_width(socket, name)?,
-            _ => None,
-        };
-
-        if !self.config.applies_to(output.as_deref(), width) {
+        let applies = self
+            .config
+            .applies_to(output.as_deref(), |name| layout::output_width(socket, name))?;
+        if !applies {
             return Ok(());
         }
 

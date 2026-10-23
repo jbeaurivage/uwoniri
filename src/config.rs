@@ -8,15 +8,16 @@ use crate::error::{self, Error, Result};
 /// ~/.config/uwoniri/config.toml (honors $XDG_CONFIG_HOME):
 ///
 /// ```toml
+/// [watch]
 /// outputs = ["DP-2"]   # optional: connector names this applies to
 /// min_width = 3440     # optional: OR apply on any output at least this many logical pixels wide
 ///
 /// [widths]             # optional, percentages in (0, 100]
 /// overflow = 33.0
 /// layouts = [          # entry i is used for workspaces with i+1 windows
-///   { master = 50.0 },
-///   { master = 50.0, side = 25.0 },
-///   { master = 40.0, side = 30.0 },
+///   { main = 50.0 },
+///   { main = 50.0, side = 25.0 },
+///   { main = 40.0, side = 30.0 },
 /// ]
 /// ```
 ///
@@ -24,17 +25,22 @@ use crate::error::{self, Error, Result};
 /// EITHER condition.
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
+    pub watch: Option<Watch>,
+    #[serde(default)]
+    pub widths: Widths,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct Watch {
     #[serde(default)]
     pub outputs: Vec<String>,
     pub min_width: Option<i32>,
-    #[serde(default)]
-    pub widths: Widths,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct Layout {
-    pub master: f64,
+    pub main: f64,
     /// Width of the other windows. Ignored for a single window.
     pub side: Option<f64>,
 }
@@ -53,15 +59,15 @@ impl Default for Widths {
         Self {
             layouts: vec![
                 Layout {
-                    master: 50.0,
+                    main: 50.0,
                     side: None,
                 },
                 Layout {
-                    master: 50.0,
+                    main: 50.0,
                     side: Some(25.0),
                 },
                 Layout {
-                    master: 40.0,
+                    main: 40.0,
                     side: Some(30.0),
                 },
             ],
@@ -89,10 +95,10 @@ impl Widths {
         let ok = |v: f64| v > 0.0 && v <= 100.0;
         for (i, l) in self.layouts.iter().enumerate() {
             let count = i + 1;
-            if !ok(l.master) {
+            if !ok(l.main) {
                 return Err(format!(
-                    "widths.layouts[{i}] ({count} windows): master = {} is outside (0, 100]",
-                    l.master
+                    "widths.layouts[{i}] ({count} windows): main = {} is outside (0, 100]",
+                    l.main
                 ));
             }
             match l.side {
@@ -127,7 +133,8 @@ impl Config {
             .join("config.toml"))
     }
 
-    /// Read and parse the config file. `Ok(None)` means there is no config file.
+    /// Read and parse the config file. `Ok(None)` means there is no config
+    /// file.
     fn try_load() -> Result<Option<(PathBuf, Self)>> {
         let path = Self::config_path()?;
 
@@ -177,20 +184,34 @@ impl Config {
     }
 
     /// Whether column-widths behavior should run for this output.
-    /// `logical_width` is only consulted for `min_width`.
-    pub fn applies_to(&self, output_name: Option<&str>, logical_width: Option<i32>) -> bool {
-        if self.outputs.is_empty() && self.min_width.is_none() {
-            return true; // unrestricted
+    /// `logical_width` is only called if the answer depends on the output's
+    /// size, i.e. `min_width` is set and the output wasn't already matched
+    /// by name.
+    pub fn applies_to(
+        &self,
+        output_name: Option<&str>,
+        mut logical_width: impl FnMut(&str) -> Result<Option<i32>>,
+    ) -> Result<bool> {
+        let Some(watch) = &self.watch else {
+            // No restriction
+            return Ok(true);
+        };
+
+        if watch.outputs.is_empty() && watch.min_width.is_none() {
+            return Ok(true); // unrestricted
         }
 
         let Some(name) = output_name else {
-            return false;
+            return Ok(false);
         };
 
-        if self.outputs.iter().any(|o| o == name) {
-            return true;
+        if watch.outputs.iter().any(|o| o == name) {
+            return Ok(true);
         }
 
-        matches!((self.min_width, logical_width), (Some(min), Some(w)) if w >= min)
+        let Some(min) = watch.min_width else {
+            return Ok(false);
+        };
+        Ok(logical_width(name)?.is_some_and(|width| width >= min))
     }
 }
