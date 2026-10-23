@@ -1,6 +1,6 @@
 [package]
 name = "uwoniri"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Justin Beaurivage <code@beaurivage.io>"]
 edition = "2024"
 rust-version = "1.88"
